@@ -17,6 +17,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.util.CommonColors;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.SpawnPlacements;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
@@ -73,7 +74,7 @@ public final class TorchPlannerHack extends Hack
             return getName() + " [" + getCalculationPercent() + "%]";
 
         if(step == Step.DONE)
-            return getName() + " [" + suggestedTorches.size() + "]";
+            return getName() + " [" + getRemainingSuggestionCount() + "]";
 
         return getName();
     }
@@ -126,8 +127,10 @@ public final class TorchPlannerHack extends Hack
         int black = 0x80000000;
         int hovered = 0x26404040;
         int selected = 0x2600FF00;
-        int suggestionFill = 0x50FFD35A;
-        int suggestionLine = 0xC0FFC941;
+        int pendingSuggestionFill = 0x50FFD35A;
+        int pendingSuggestionLine = 0xC0FFC941;
+        int completedSuggestionFill = 0x5000C85A;
+        int completedSuggestionLine = 0xC000FF80;
 
         if(selection == null && step == Step.END_POS && Step.START_POS.pos != null
             && Step.END_POS.pos != null)
@@ -158,12 +161,32 @@ public final class TorchPlannerHack extends Hack
 
         if(!suggestedTorches.isEmpty())
         {
-            ArrayList<AABB> boxes = new ArrayList<>(suggestedTorches.size());
+            ArrayList<AABB> pendingBoxes = new ArrayList<>(suggestedTorches.size());
+            ArrayList<AABB> completedBoxes = new ArrayList<>(suggestedTorches.size());
             for(BlockPos pos : suggestedTorches)
-                boxes.add(new AABB(pos).deflate(1 / 16.0));
+            {
+                AABB box = new AABB(pos).deflate(1 / 16.0);
+                if(isSuggestionCompleted(pos))
+                    completedBoxes.add(box);
+                else
+                    pendingBoxes.add(box);
+            }
 
-            RenderUtils.drawSolidBoxes(matrixStack, boxes, suggestionFill, false);
-            RenderUtils.drawOutlinedBoxes(matrixStack, boxes, suggestionLine, false);
+            if(!pendingBoxes.isEmpty())
+            {
+                RenderUtils.drawSolidBoxes(matrixStack, pendingBoxes,
+                    pendingSuggestionFill, false);
+                RenderUtils.drawOutlinedBoxes(matrixStack, pendingBoxes,
+                    pendingSuggestionLine, false);
+            }
+
+            if(!completedBoxes.isEmpty())
+            {
+                RenderUtils.drawSolidBoxes(matrixStack, completedBoxes,
+                    completedSuggestionFill, false);
+                RenderUtils.drawOutlinedBoxes(matrixStack, completedBoxes,
+                    completedSuggestionLine, false);
+            }
         }
     }
 
@@ -175,7 +198,9 @@ public final class TorchPlannerHack extends Hack
             message = "Press enter to confirm, or select a different position.";
         else if(step == Step.DONE)
         {
-            message = "Suggested " + suggestedTorches.size() + " torch positions."
+            int remaining = getRemainingSuggestionCount();
+            message = "Remaining suggestions: " + remaining + " / "
+                + suggestedTorches.size() + "."
                 + (uncoveredSpawnableCount > 0
                     ? " " + uncoveredSpawnableCount + " spots are still uncovered."
                     : "");
@@ -459,6 +484,26 @@ public final class TorchPlannerHack extends Hack
             return Math.min(99, Math.max(0, basePercent));
 
         return Math.min(100, Math.max(0, basePercent));
+    }
+
+    private int getRemainingSuggestionCount()
+    {
+        int remaining = 0;
+
+        for(BlockPos pos : suggestedTorches)
+            if(!isSuggestionCompleted(pos))
+                remaining++;
+
+        return remaining;
+    }
+
+    private boolean isSuggestionCompleted(BlockPos pos)
+    {
+        BlockState state = MC.level.getBlockState(pos);
+        return state.is(Blocks.TORCH) || state.is(Blocks.WALL_TORCH)
+            || state.is(Blocks.SOUL_TORCH) || state.is(Blocks.SOUL_WALL_TORCH)
+            || state.is(Blocks.REDSTONE_TORCH)
+            || state.is(Blocks.REDSTONE_WALL_TORCH);
     }
 
     private boolean isCoveredByTorch(BlockPos spawnableSpot, BlockPos torchPos)
