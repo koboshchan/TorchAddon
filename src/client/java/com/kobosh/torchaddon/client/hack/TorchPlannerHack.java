@@ -1,11 +1,13 @@
 package com.kobosh.torchaddon.client.hack;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.lwjgl.glfw.GLFW;
 
@@ -30,7 +32,6 @@ import net.wurstclient.events.GUIRenderListener;
 import net.wurstclient.events.RenderListener;
 import net.wurstclient.events.UpdateListener;
 import net.wurstclient.hack.Hack;
-import net.wurstclient.settings.EnumSetting;
 import net.wurstclient.settings.SliderSetting;
 import net.wurstclient.settings.SliderSetting.ValueDisplay;
 import net.wurstclient.util.BlockUtils;
@@ -44,9 +45,9 @@ public final class TorchPlannerHack extends Hack
     private static final int TORCH_LIGHT_RADIUS = 13;
     private static final int MAX_SELECTION_VOLUME = 524288;
 
-    private final EnumSetting<Quality> quality =
-        new EnumSetting<>("Planning quality", Quality.values(),
-            Quality.BALANCED);
+    private final SliderSetting checksPerTick =
+        new SliderSetting("Checks per tick", 300000, 100000, 2500000,
+            100000, ValueDisplay.INTEGER.withSuffix(" checks/tick"));
 
     private final SliderSetting renderLimit =
         new SliderSetting("Render limit", 256, 32, 2048, 32,
@@ -60,18 +61,20 @@ public final class TorchPlannerHack extends Hack
     private int uncoveredSpawnableCount;
 
     private CalcPhase calcPhase = CalcPhase.IDLE;
-    private ArrayList<BlockPos> calcCandidates = new ArrayList<>();
-    private HashSet<BlockPos> calcUncovered = new HashSet<>();
-    private ArrayList<BlockPos> calcUncoveredList = new ArrayList<>();
+    private ArrayList<CandidateCoverage> calcCandidates = new ArrayList<>();
+    private HashSet<Long> calcUncovered = new HashSet<>();
     private int calcTotalSpawnable;
     private int calcCoveredSpawnable;
     private int calcCandidateIndex;
-    private int calcUncoveredIndex;
+    private CandidateCoverage calcCurrentCandidate;
+    private int calcCurrentSpotIndex;
     private int calcCurrentCoverage;
-    private BlockPos calcBestCandidate;
+    private CandidateCoverage calcBestCandidate;
     private int calcBestCoverage;
     private long calcRoundChecksDone;
     private long calcRoundChecksTotal;
+    private CompletableFuture<SolveResult> solveFuture;
+    private final AtomicInteger asyncPercent = new AtomicInteger(0);
     private final Map<Long, HashSet<Long>> coverageTrueCache = new HashMap<>();
     private final Map<Long, HashSet<Long>> coverageFalseCache =
         new HashMap<>();
@@ -80,7 +83,7 @@ public final class TorchPlannerHack extends Hack
     {
         super("TorchPlanner");
         setCategory(Category.RENDER);
-        addSetting(quality);
+        addSetting(checksPerTick);
         addSetting(renderLimit);
     }
 
@@ -136,6 +139,9 @@ public final class TorchPlannerHack extends Hack
             handlePositionSelection();
         else if(step == Step.CALCULATE)
             calculateSuggestions();
+
+        if(calcPhase == CalcPhase.ASYNC_RUNNING)
+            pollAsyncSolve();
     }
 
     @Override
@@ -304,25 +310,110 @@ public final class TorchPlannerHack extends Hack
             }
 
             suggestedTorches.clear();
-            calcCandidates = candidates;
-            calcUncovered = new HashSet<>(spawnableSpots);
+            calcCandidates = buildCandidateCoverages(candidates, spawnableSpots);
+            if(calcCandidates.isEmpty())
+            {
+                uncoveredSpawnableCount = spawnableSpots.size();
+                step = Step.DONE;
+                ChatUtils.error(
+                    "TorchPlanner: No candidate can cover spawn spots in this selection.");
+                return;
+            }
+
+            calcUncovered.clear();
+            for(BlockPos spot : spawnableSpots)
+                calcUncovered.add(spot.asLong());
+
             coverageTrueCache.clear();
             coverageFalseCache.clear();
             calcTotalSpawnable = spawnableSpots.size();
             calcCoveredSpawnable = 0;
-            startBestCandidateSearchRound();
-            calcPhase = CalcPhase.SEARCH_BEST;
+
+            ArrayList<CandidateCoverage> workerCandidates =
+                new ArrayList<>(calcCandidates);
+            HashSet<Long> workerUncovered = new HashSet<>(calcUncovered);
+            asyncPercent.set(0);
+            solveFuture = CompletableFuture.supplyAsync(() ->
+                solveGreedyWorker(workerCandidates, workerUncovered,
+                    calcTotalSpawnable, asyncPercent));
+            calcPhase = CalcPhase.ASYNC_RUNNING;
             return;
         }
+    }
 
-        if(calcPhase == CalcPhase.SEARCH_BEST)
+    private void pollAsyncSolve()
+    {
+        if(solveFuture == null || !solveFuture.isDone())
+            return;
+
+        SolveResult result;
+        try
         {
-            processBestCandidateSearch();
+            result = solveFuture.join();
+
+        }catch(RuntimeException e)
+        {
+            ChatUtils.error("TorchPlanner: Solve failed.");
+            resetCalculationState();
+            setEnabled(false);
             return;
         }
 
-        if(calcPhase == CalcPhase.APPLY_BEST)
-            applyBestCandidate();
+        suggestedTorches.clear();
+        suggestedTorches.addAll(result.positions());
+        uncoveredSpawnableCount = result.uncoveredCount();
+        calcCoveredSpawnable = calcTotalSpawnable - uncoveredSpawnableCount;
+        step = Step.DONE;
+        ChatUtils.message("TorchPlanner: Suggested " + suggestedTorches.size()
+            + " torch positions for " + calcTotalSpawnable + " spawnable spots."
+            + (uncoveredSpawnableCount > 0
+                ? " " + uncoveredSpawnableCount + " spots remain uncovered."
+                : ""));
+        resetCalculationState();
+    }
+
+    private static SolveResult solveGreedyWorker(
+        ArrayList<CandidateCoverage> candidates, HashSet<Long> uncovered,
+        int totalSpawnable, AtomicInteger progress)
+    {
+        ArrayList<BlockPos> chosen = new ArrayList<>();
+
+        while(!uncovered.isEmpty() && !candidates.isEmpty())
+        {
+            CandidateScore best = candidates.parallelStream()
+                .map(c -> new CandidateScore(c, countCoverage(c, uncovered)))
+                .max(Comparator.comparingInt(CandidateScore::coverage)).orElse(null);
+
+            if(best == null || best.coverage() <= 0)
+                break;
+
+            CandidateCoverage bestCandidate = best.candidate();
+            chosen.add(bestCandidate.pos());
+            candidates.remove(bestCandidate);
+
+            for(long spot : bestCandidate.spotLongs())
+                uncovered.remove(spot);
+
+            if(totalSpawnable > 0)
+            {
+                int covered = totalSpawnable - uncovered.size();
+                int percent = (int)Math.floor((double)covered * 100.0 / totalSpawnable);
+                progress.set(Math.min(99, Math.max(0, percent)));
+            }
+        }
+
+        progress.set(100);
+        return new SolveResult(chosen, uncovered.size());
+    }
+
+    private static int countCoverage(CandidateCoverage candidate,
+        HashSet<Long> uncovered)
+    {
+        int count = 0;
+        for(long spot : candidate.spotLongs())
+            if(uncovered.contains(spot))
+                count++;
+        return count;
     }
 
     private List<BlockPos> collectSpawnableSpots(Selection selected)
@@ -394,6 +485,73 @@ public final class TorchPlannerHack extends Hack
         return buckets;
     }
 
+    private Map<Long, ArrayList<BlockPos>> buildSpawnSpotBuckets(
+        List<BlockPos> spawnableSpots)
+    {
+        HashMap<Long, ArrayList<BlockPos>> buckets = new HashMap<>();
+
+        for(BlockPos spot : spawnableSpots)
+        {
+            long key = bucketKey(spot.getX(), spot.getY(), spot.getZ());
+            buckets.computeIfAbsent(key, k -> new ArrayList<>()).add(spot);
+        }
+
+        return buckets;
+    }
+
+    private ArrayList<CandidateCoverage> buildCandidateCoverages(
+        ArrayList<BlockPos> candidates, List<BlockPos> spawnableSpots)
+    {
+        Map<Long, ArrayList<BlockPos>> spawnBuckets =
+            buildSpawnSpotBuckets(spawnableSpots);
+        ArrayList<CandidateCoverage> result = new ArrayList<>(candidates.size());
+
+        for(BlockPos candidate : candidates)
+        {
+            ArrayList<Long> covered = getCoveredSpawnSpots(candidate, spawnBuckets);
+            if(covered.isEmpty())
+                continue;
+
+            result.add(new CandidateCoverage(candidate, toLongArray(covered)));
+        }
+
+        return result;
+    }
+
+    private ArrayList<Long> getCoveredSpawnSpots(BlockPos candidate,
+        Map<Long, ArrayList<BlockPos>> spawnBuckets)
+    {
+        ArrayList<Long> covered = new ArrayList<>();
+
+        int bx = floorDiv(candidate.getX(), 8);
+        int by = floorDiv(candidate.getY(), 8);
+        int bz = floorDiv(candidate.getZ(), 8);
+
+        for(int y = by - 2; y <= by + 2; y++)
+            for(int z = bz - 2; z <= bz + 2; z++)
+                for(int x = bx - 2; x <= bx + 2; x++)
+                {
+                    ArrayList<BlockPos> spots =
+                        spawnBuckets.get(bucketKeyFromBuckets(x, y, z));
+                    if(spots == null)
+                        continue;
+
+                    for(BlockPos spot : spots)
+                        if(isCoveredByTorch(spot, candidate))
+                            covered.add(spot.asLong());
+                }
+
+        return covered;
+    }
+
+    private static long[] toLongArray(ArrayList<Long> values)
+    {
+        long[] arr = new long[values.size()];
+        for(int i = 0; i < values.size(); i++)
+            arr[i] = values.get(i);
+        return arr;
+    }
+
     private boolean hasNearbySpawnBucket(BlockPos pos,
         Map<Long, Integer> spawnBuckets)
     {
@@ -435,52 +593,68 @@ public final class TorchPlannerHack extends Hack
 
     private void startBestCandidateSearchRound()
     {
-        calcUncoveredList = new ArrayList<>(calcUncovered);
         calcCandidateIndex = 0;
-        calcUncoveredIndex = 0;
+        calcCurrentCandidate = null;
+        calcCurrentSpotIndex = 0;
         calcCurrentCoverage = 0;
         calcBestCandidate = null;
         calcBestCoverage = 0;
         calcRoundChecksDone = 0;
-        calcRoundChecksTotal =
-            (long)calcCandidates.size() * (long)calcUncoveredList.size();
+
+        long totalChecks = 0;
+        for(CandidateCoverage candidate : calcCandidates)
+            totalChecks += candidate.spotLongs().length;
+        calcRoundChecksTotal = totalChecks;
     }
 
     private void processBestCandidateSearch()
     {
-        int checksLeft = quality.getSelected().checksPerTick;
+        int checksLeft = checksPerTick.getValueI();
 
         while(checksLeft > 0 && calcCandidateIndex < calcCandidates.size())
         {
-            BlockPos candidate = calcCandidates.get(calcCandidateIndex);
-
-            while(checksLeft > 0 && calcUncoveredIndex < calcUncoveredList.size())
+            if(calcCurrentCandidate == null)
             {
-                int remainingSpots = calcUncoveredList.size() - calcUncoveredIndex;
+                calcCurrentCandidate = calcCandidates.get(calcCandidateIndex);
+                calcCurrentSpotIndex = 0;
+                calcCurrentCoverage = 0;
+
+                if(calcCurrentCandidate.spotLongs().length <= calcBestCoverage)
+                {
+                    calcCandidateIndex++;
+                    calcCurrentCandidate = null;
+                    continue;
+                }
+            }
+
+            long[] spots = calcCurrentCandidate.spotLongs();
+
+            while(checksLeft > 0 && calcCurrentSpotIndex < spots.length)
+            {
+                int remainingSpots = spots.length - calcCurrentSpotIndex;
                 if(calcCurrentCoverage + remainingSpots <= calcBestCoverage)
                 {
                     // Branch-and-bound: this candidate cannot beat the current
                     // best even if all remaining spots were covered.
                     calcRoundChecksDone += remainingSpots;
-                    calcUncoveredIndex = calcUncoveredList.size();
+                    calcCurrentSpotIndex = spots.length;
                     break;
                 }
 
-                BlockPos spot = calcUncoveredList.get(calcUncoveredIndex);
-                if(isCoveredByTorch(spot, candidate))
+                if(calcUncovered.contains(spots[calcCurrentSpotIndex]))
                     calcCurrentCoverage++;
 
-                calcUncoveredIndex++;
+                calcCurrentSpotIndex++;
                 calcRoundChecksDone++;
                 checksLeft--;
             }
 
-            if(calcUncoveredIndex >= calcUncoveredList.size())
+            if(calcCurrentSpotIndex >= spots.length)
             {
                 if(calcCurrentCoverage > calcBestCoverage)
                 {
                     calcBestCoverage = calcCurrentCoverage;
-                    calcBestCandidate = candidate;
+                    calcBestCandidate = calcCurrentCandidate;
                 }
 
                 if(calcCurrentCoverage == 0)
@@ -488,7 +662,8 @@ public final class TorchPlannerHack extends Hack
                 else
                     calcCandidateIndex++;
 
-                calcUncoveredIndex = 0;
+                calcCurrentCandidate = null;
+                calcCurrentSpotIndex = 0;
                 calcCurrentCoverage = 0;
             }
         }
@@ -507,19 +682,14 @@ public final class TorchPlannerHack extends Hack
 
     private void applyBestCandidate()
     {
-        suggestedTorches.add(calcBestCandidate);
+        suggestedTorches.add(calcBestCandidate.pos());
         calcCandidates.remove(calcBestCandidate);
 
         int removedThisRound = 0;
-        Iterator<BlockPos> iterator = calcUncovered.iterator();
-        while(iterator.hasNext())
+        for(long spotLong : calcBestCandidate.spotLongs())
         {
-            BlockPos spot = iterator.next();
-            if(!isCoveredByTorch(spot, calcBestCandidate))
-                continue;
-
-            iterator.remove();
-            removedThisRound++;
+            if(calcUncovered.remove(spotLong))
+                removedThisRound++;
         }
 
         calcCoveredSpawnable += removedThisRound;
@@ -554,19 +724,24 @@ public final class TorchPlannerHack extends Hack
 
     private void resetCalculationState()
     {
+        if(solveFuture != null && !solveFuture.isDone())
+            solveFuture.cancel(true);
+
         calcPhase = CalcPhase.IDLE;
         calcCandidates.clear();
         calcUncovered.clear();
-        calcUncoveredList.clear();
         calcTotalSpawnable = 0;
         calcCoveredSpawnable = 0;
         calcCandidateIndex = 0;
-        calcUncoveredIndex = 0;
+        calcCurrentCandidate = null;
+        calcCurrentSpotIndex = 0;
         calcCurrentCoverage = 0;
         calcBestCandidate = null;
         calcBestCoverage = 0;
         calcRoundChecksDone = 0;
         calcRoundChecksTotal = 0;
+        solveFuture = null;
+        asyncPercent.set(0);
         coverageTrueCache.clear();
         coverageFalseCache.clear();
     }
@@ -575,6 +750,9 @@ public final class TorchPlannerHack extends Hack
     {
         if(calcTotalSpawnable <= 0)
             return 0;
+
+        if(calcPhase == CalcPhase.ASYNC_RUNNING)
+            return Math.min(99, Math.max(0, asyncPercent.get()));
 
         double coveredRatio = (double)calcCoveredSpawnable / calcTotalSpawnable;
         int basePercent = (int)Math.floor(coveredRatio * 100.0);
@@ -678,31 +856,8 @@ public final class TorchPlannerHack extends Hack
     {
         IDLE,
         SEARCH_BEST,
-        APPLY_BEST
-    }
-
-    private static enum Quality
-    {
-        FAST("Fast", 120000),
-
-        BALANCED("Balanced", 300000),
-
-        THOROUGH("Thorough", 700000);
-
-        private final String name;
-        private final int checksPerTick;
-
-        private Quality(String name, int checksPerTick)
-        {
-            this.name = name;
-            this.checksPerTick = checksPerTick;
-        }
-
-        @Override
-        public String toString()
-        {
-            return name;
-        }
+        APPLY_BEST,
+        ASYNC_RUNNING
     }
 
     private static record Selection(BlockPos min, BlockPos max, AABB box, int volume)
@@ -720,5 +875,19 @@ public final class TorchPlannerHack extends Hack
                     * (Math.abs(pos1.getY() - pos2.getY()) + 1)
                     * (Math.abs(pos1.getZ() - pos2.getZ()) + 1));
         }
+    }
+
+    private static record CandidateCoverage(BlockPos pos, long[] spotLongs)
+    {
+    }
+
+    private static record CandidateScore(CandidateCoverage candidate,
+        int coverage)
+    {
+    }
+
+    private static record SolveResult(ArrayList<BlockPos> positions,
+        int uncoveredCount)
+    {
     }
 }
