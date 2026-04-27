@@ -30,6 +30,9 @@ import net.wurstclient.events.GUIRenderListener;
 import net.wurstclient.events.RenderListener;
 import net.wurstclient.events.UpdateListener;
 import net.wurstclient.hack.Hack;
+import net.wurstclient.settings.EnumSetting;
+import net.wurstclient.settings.SliderSetting;
+import net.wurstclient.settings.SliderSetting.ValueDisplay;
 import net.wurstclient.util.BlockUtils;
 import net.wurstclient.util.ChatUtils;
 import net.wurstclient.util.RenderUtils;
@@ -40,7 +43,14 @@ public final class TorchPlannerHack extends Hack
 {
     private static final int TORCH_LIGHT_RADIUS = 13;
     private static final int MAX_SELECTION_VOLUME = 524288;
-    private static final int COVERAGE_CHECK_BUDGET_PER_TICK = 300000;
+
+    private final EnumSetting<Quality> quality =
+        new EnumSetting<>("Planning quality", Quality.values(),
+            Quality.BALANCED);
+
+    private final SliderSetting renderLimit =
+        new SliderSetting("Render limit", 256, 32, 2048, 32,
+            ValueDisplay.INTEGER.withSuffix(" boxes"));
 
     private Step step;
     private BlockPos posLookingAt;
@@ -70,6 +80,8 @@ public final class TorchPlannerHack extends Hack
     {
         super("TorchPlanner");
         setCategory(Category.RENDER);
+        addSetting(quality);
+        addSetting(renderLimit);
     }
 
     @Override
@@ -166,10 +178,14 @@ public final class TorchPlannerHack extends Hack
 
         if(!suggestedTorches.isEmpty())
         {
-            ArrayList<AABB> pendingBoxes = new ArrayList<>(suggestedTorches.size());
-            ArrayList<AABB> completedBoxes = new ArrayList<>(suggestedTorches.size());
-            for(BlockPos pos : suggestedTorches)
+            int maxRendered = Math.min(renderLimit.getValueI(),
+                suggestedTorches.size());
+
+            ArrayList<AABB> pendingBoxes = new ArrayList<>(maxRendered);
+            ArrayList<AABB> completedBoxes = new ArrayList<>(maxRendered);
+            for(int i = 0; i < maxRendered; i++)
             {
+                BlockPos pos = suggestedTorches.get(i);
                 AABB box = new AABB(pos).deflate(1 / 16.0);
                 if(isSuggestionCompleted(pos))
                     completedBoxes.add(box);
@@ -432,7 +448,7 @@ public final class TorchPlannerHack extends Hack
 
     private void processBestCandidateSearch()
     {
-        int checksLeft = COVERAGE_CHECK_BUDGET_PER_TICK;
+        int checksLeft = quality.getSelected().checksPerTick;
 
         while(checksLeft > 0 && calcCandidateIndex < calcCandidates.size())
         {
@@ -663,6 +679,30 @@ public final class TorchPlannerHack extends Hack
         IDLE,
         SEARCH_BEST,
         APPLY_BEST
+    }
+
+    private static enum Quality
+    {
+        FAST("Fast", 120000),
+
+        BALANCED("Balanced", 300000),
+
+        THOROUGH("Thorough", 700000);
+
+        private final String name;
+        private final int checksPerTick;
+
+        private Quality(String name, int checksPerTick)
+        {
+            this.name = name;
+            this.checksPerTick = checksPerTick;
+        }
+
+        @Override
+        public String toString()
+        {
+            return name;
+        }
     }
 
     private static record Selection(BlockPos min, BlockPos max, AABB box, int volume)
