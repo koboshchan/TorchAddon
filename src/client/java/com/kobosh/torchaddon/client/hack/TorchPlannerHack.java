@@ -39,8 +39,8 @@ public final class TorchPlannerHack extends Hack
     implements UpdateListener, RenderListener, GUIRenderListener
 {
     private static final int TORCH_LIGHT_RADIUS = 13;
-    private static final int MAX_SELECTION_VOLUME = 131072;
-    private static final int COVERAGE_CHECK_BUDGET_PER_TICK = 120000;
+    private static final int MAX_SELECTION_VOLUME = 524288;
+    private static final int COVERAGE_CHECK_BUDGET_PER_TICK = 300000;
 
     private Step step;
     private BlockPos posLookingAt;
@@ -274,7 +274,9 @@ public final class TorchPlannerHack extends Hack
                 return;
             }
 
-            ArrayList<BlockPos> candidates = collectTorchCandidates(selection);
+            Map<Long, Integer> spawnBuckets = buildSpawnBuckets(spawnableSpots);
+            ArrayList<BlockPos> candidates =
+                collectTorchCandidates(selection, spawnBuckets);
             if(candidates.isEmpty())
             {
                 suggestedTorches.clear();
@@ -322,7 +324,8 @@ public final class TorchPlannerHack extends Hack
         return spawnableSpots;
     }
 
-    private ArrayList<BlockPos> collectTorchCandidates(Selection selected)
+    private ArrayList<BlockPos> collectTorchCandidates(Selection selected,
+        Map<Long, Integer> spawnBuckets)
     {
         ArrayList<BlockPos> candidates = new ArrayList<>();
 
@@ -353,10 +356,65 @@ public final class TorchPlannerHack extends Hack
             if(!hasFloorSupport && !hasWallSupport)
                 continue;
 
+            if(!hasNearbySpawnBucket(pos, spawnBuckets))
+                continue;
+
             candidates.add(pos.immutable());
         }
 
         return candidates;
+    }
+
+    private Map<Long, Integer> buildSpawnBuckets(List<BlockPos> spawnableSpots)
+    {
+        HashMap<Long, Integer> buckets = new HashMap<>();
+
+        for(BlockPos spot : spawnableSpots)
+        {
+            long key = bucketKey(spot.getX(), spot.getY(), spot.getZ());
+            buckets.merge(key, 1, Integer::sum);
+        }
+
+        return buckets;
+    }
+
+    private boolean hasNearbySpawnBucket(BlockPos pos,
+        Map<Long, Integer> spawnBuckets)
+    {
+        int bx = floorDiv(pos.getX(), 8);
+        int by = floorDiv(pos.getY(), 8);
+        int bz = floorDiv(pos.getZ(), 8);
+
+        // Radius 13 can reach into buckets up to +/-2 in each axis.
+        for(int y = by - 2; y <= by + 2; y++)
+            for(int z = bz - 2; z <= bz + 2; z++)
+                for(int x = bx - 2; x <= bx + 2; x++)
+                    if(spawnBuckets.containsKey(bucketKeyFromBuckets(x, y, z)))
+                        return true;
+
+        return false;
+    }
+
+    private static long bucketKey(int x, int y, int z)
+    {
+        return bucketKeyFromBuckets(floorDiv(x, 8), floorDiv(y, 8),
+            floorDiv(z, 8));
+    }
+
+    private static long bucketKeyFromBuckets(int bx, int by, int bz)
+    {
+        long lx = ((long)bx) & 0x1FFFFFL;
+        long ly = ((long)by) & 0x1FFFFFL;
+        long lz = ((long)bz) & 0x1FFFFFL;
+        return (lx << 42) | (ly << 21) | lz;
+    }
+
+    private static int floorDiv(int value, int div)
+    {
+        int result = value / div;
+        if((value ^ div) < 0 && result * div != value)
+            result--;
+        return result;
     }
 
     private void startBestCandidateSearchRound()
