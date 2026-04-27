@@ -1,1 +1,4 @@
-{"description.wurst.hack.examplehack": "Example Hack description"}
+{
+	"description.wurst.hack.examplehack": "Example Hack description",
+	"description.wurst.hack.torchplanner": "Calculates and highlights suggested torch placements in a selected area to reduce hostile mob spawns."
+}
