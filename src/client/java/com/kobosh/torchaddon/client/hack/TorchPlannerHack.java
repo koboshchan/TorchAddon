@@ -196,18 +196,13 @@ public final class TorchPlannerHack extends Hack
     @Override
     public void onRenderGUI(GuiGraphics context, float partialTicks)
     {
+        if(step == Step.DONE)
+            return;
+
         String message;
         if(step.selectPos && step.pos != null)
             message = "Press enter to confirm, or select a different position.";
-        else if(step == Step.DONE)
-        {
-            int remaining = getRemainingSuggestionCount();
-            message = "Remaining suggestions: " + remaining + " / "
-                + suggestedTorches.size() + "."
-                + (uncoveredSpawnableCount > 0
-                    ? " " + uncoveredSpawnableCount + " spots are still uncovered."
-                    : "");
-        }else
+        else
             message = step.message;
 
         Font tr = MC.font;
