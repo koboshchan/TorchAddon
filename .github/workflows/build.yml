@@ -42,8 +42,8 @@ jobs:
       with:
         name: WurstAddon-build
         path: |
-          build/libs/WurstAddon-*.jar
-          wurst7-base/build/libs/Wurst-Client-*.jar
+          build/libs/*.jar
+          wurst7-base/build/libs/*.jar
         retention-days: 30
 
     - name: Create Release (on tag)
@@ -51,7 +51,7 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         files: |
-          build/libs/WurstAddon-*.jar
-          wurst7-base/build/libs/Wurst-Client-*.jar
+          build/libs/*.jar
+          wurst7-base/build/libs/*.jar
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
