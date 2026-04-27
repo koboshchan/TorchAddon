@@ -1,29 +1,29 @@
 {
   "schemaVersion": 1,
-  "id": "wurstaddon",
+  "id": "torchaddon",
   "version": "${version}",
-  "name": "WurstAddon",
-  "description": "addon for wurst client",
+  "name": "TorchAddon",
+  "description": "addon for wurst client that calculates the optimal torch placement for you",
   "authors": [],
   "contact": {},
   "license": "All-Rights-Reserved",
-  "icon": "assets/wurstaddon/icon.png",
+  "icon": "assets/torchaddon/icon.png",
   "environment": "*",
   "entrypoints": {
     "fabric-datagen": [
-      "com.kobosh.wurstaddon.client.WurstaddonDataGenerator"
+      "com.kobosh.torchaddon.client.WurstaddonDataGenerator"
     ],
     "client": [
-      "com.kobosh.wurstaddon.client.WurstaddonClient"
+      "com.kobosh.torchaddon.client.WurstaddonClient"
     ],
     "main": [
-      "com.kobosh.wurstaddon.Wurstaddon"
+      "com.kobosh.torchaddon.Wurstaddon"
     ]
   },
   "mixins": [
-    "wurstaddon.mixins.json",
+    "torchaddon.mixins.json",
     {
-      "config": "wurstaddon.client.mixins.json",
+      "config": "torchaddon.client.mixins.json",
       "environment": "client"
     }
   ],

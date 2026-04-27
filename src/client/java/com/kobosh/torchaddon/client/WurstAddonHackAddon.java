@@ -1,9 +1,9 @@
-package com.kobosh.wurstaddon.client;
+package com.kobosh.torchaddon.client;
 
 import net.wurstclient.addon.Addon;
 import net.wurstclient.command.Command;
 import net.wurstclient.hack.Hack;
-import com.kobosh.wurstaddon.client.hack.ExampleHack;
+import com.kobosh.torchaddon.client.hack.ExampleHack;
 
 /**
  * WurstAddon provider for registering hacks and commands with Wurst7.

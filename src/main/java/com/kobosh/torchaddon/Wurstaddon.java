@@ -1,4 +1,4 @@
-package com.kobosh.wurstaddon;
+package com.kobosh.torchaddon;
 
 import net.fabricmc.api.ModInitializer;
 

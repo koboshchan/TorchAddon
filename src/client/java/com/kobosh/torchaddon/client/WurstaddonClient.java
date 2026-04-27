@@ -1,4 +1,4 @@
-package com.kobosh.wurstaddon.client;
+package com.kobosh.torchaddon.client;
 
 import net.fabricmc.api.ClientModInitializer;
 

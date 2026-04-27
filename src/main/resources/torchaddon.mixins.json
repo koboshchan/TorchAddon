@@ -1,9 +1,9 @@
 {
   "required": true,
   "minVersion": "0.8",
-  "package": "com.kobosh.wurstaddon.mixin.client",
+  "package": "com.kobosh.torchaddon.mixin",
   "compatibilityLevel": "JAVA_21",
-  "client": [
+  "mixins": [
   ],
   "injectors": {
     "defaultRequire": 1

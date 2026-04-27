@@ -1,4 +1,4 @@
-package com.kobosh.wurstaddon.client.hack;
+package com.kobosh.torchaddon.client.hack;
 
 import net.wurstclient.Category;
 import net.wurstclient.hack.Hack;
