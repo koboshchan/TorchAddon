@@ -1,9 +1,11 @@
 package com.kobosh.torchaddon.client.hack;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 import org.lwjgl.glfw.GLFW;
 
@@ -38,7 +40,7 @@ public final class TorchPlannerHack extends Hack
 {
     private static final int TORCH_LIGHT_RADIUS = 13;
     private static final int MAX_SELECTION_VOLUME = 131072;
-    private static final int COVERAGE_CHECK_BUDGET_PER_TICK = 40000;
+    private static final int COVERAGE_CHECK_BUDGET_PER_TICK = 120000;
 
     private Step step;
     private BlockPos posLookingAt;
@@ -60,6 +62,7 @@ public final class TorchPlannerHack extends Hack
     private int calcBestCoverage;
     private long calcRoundChecksDone;
     private long calcRoundChecksTotal;
+    private final Map<CoverageKey, Boolean> coverageCache = new HashMap<>();
 
     public TorchPlannerHack()
     {
@@ -288,6 +291,7 @@ public final class TorchPlannerHack extends Hack
             suggestedTorches.clear();
             calcCandidates = candidates;
             calcUncovered = new HashSet<>(spawnableSpots);
+            coverageCache.clear();
             calcTotalSpawnable = spawnableSpots.size();
             calcCoveredSpawnable = 0;
             startBestCandidateSearchRound();
@@ -332,7 +336,23 @@ public final class TorchPlannerHack extends Hack
 
             BlockPos below = pos.below();
             BlockState belowState = MC.level.getBlockState(below);
-            if(!belowState.isFaceSturdy(MC.level, below, Direction.UP))
+            boolean hasFloorSupport =
+                belowState.isFaceSturdy(MC.level, below, Direction.UP);
+            boolean hasWallSupport = false;
+
+            for(Direction direction : Direction.Plane.HORIZONTAL)
+            {
+                BlockPos sidePos = pos.relative(direction);
+                BlockState sideState = MC.level.getBlockState(sidePos);
+                if(!sideState.isFaceSturdy(MC.level, sidePos,
+                    direction.getOpposite()))
+                    continue;
+
+                hasWallSupport = true;
+                break;
+            }
+
+            if(!hasFloorSupport && !hasWallSupport)
                 continue;
 
             candidates.add(pos.immutable());
@@ -461,6 +481,7 @@ public final class TorchPlannerHack extends Hack
         calcBestCoverage = 0;
         calcRoundChecksDone = 0;
         calcRoundChecksTotal = 0;
+        coverageCache.clear();
     }
 
     private int getCalculationPercent()
@@ -514,12 +535,24 @@ public final class TorchPlannerHack extends Hack
         if(dx + dy + dz > TORCH_LIGHT_RADIUS)
             return false;
 
+        CoverageKey key =
+            new CoverageKey(torchPos.asLong(), spawnableSpot.asLong());
+        Boolean cached = coverageCache.get(key);
+        if(cached != null)
+            return cached;
+
         // Prevent counting spots that are only reachable through walls.
         Vec3 torchCenter = new Vec3(torchPos.getX() + 0.5, torchPos.getY() + 0.6,
             torchPos.getZ() + 0.5);
         Vec3 spawnCenter = new Vec3(spawnableSpot.getX() + 0.5,
             spawnableSpot.getY() + 1.0, spawnableSpot.getZ() + 0.5);
-        return BlockUtils.hasLineOfSight(torchCenter, spawnCenter);
+        boolean covered = BlockUtils.hasLineOfSight(torchCenter, spawnCenter);
+        coverageCache.put(key, covered);
+        return covered;
+    }
+
+    private static record CoverageKey(long torchPosLong, long spawnPosLong)
+    {
     }
 
     private static enum Step
