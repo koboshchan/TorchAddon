@@ -1,11 +1,11 @@
 package com.kobosh.torchaddon.client.hack;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.HashMap;
 
 import org.lwjgl.glfw.GLFW;
 
@@ -62,7 +62,9 @@ public final class TorchPlannerHack extends Hack
     private int calcBestCoverage;
     private long calcRoundChecksDone;
     private long calcRoundChecksTotal;
-    private final Map<CoverageKey, Boolean> coverageCache = new HashMap<>();
+    private final Map<Long, HashSet<Long>> coverageTrueCache = new HashMap<>();
+    private final Map<Long, HashSet<Long>> coverageFalseCache =
+        new HashMap<>();
 
     public TorchPlannerHack()
     {
@@ -286,7 +288,8 @@ public final class TorchPlannerHack extends Hack
             suggestedTorches.clear();
             calcCandidates = candidates;
             calcUncovered = new HashSet<>(spawnableSpots);
-            coverageCache.clear();
+            coverageTrueCache.clear();
+            coverageFalseCache.clear();
             calcTotalSpawnable = spawnableSpots.size();
             calcCoveredSpawnable = 0;
             startBestCandidateSearchRound();
@@ -379,6 +382,16 @@ public final class TorchPlannerHack extends Hack
 
             while(checksLeft > 0 && calcUncoveredIndex < calcUncoveredList.size())
             {
+                int remainingSpots = calcUncoveredList.size() - calcUncoveredIndex;
+                if(calcCurrentCoverage + remainingSpots <= calcBestCoverage)
+                {
+                    // Branch-and-bound: this candidate cannot beat the current
+                    // best even if all remaining spots were covered.
+                    calcRoundChecksDone += remainingSpots;
+                    calcUncoveredIndex = calcUncoveredList.size();
+                    break;
+                }
+
                 BlockPos spot = calcUncoveredList.get(calcUncoveredIndex);
                 if(isCoveredByTorch(spot, candidate))
                     calcCurrentCoverage++;
@@ -396,7 +409,11 @@ public final class TorchPlannerHack extends Hack
                     calcBestCandidate = candidate;
                 }
 
-                calcCandidateIndex++;
+                if(calcCurrentCoverage == 0)
+                    calcCandidates.remove(calcCandidateIndex);
+                else
+                    calcCandidateIndex++;
+
                 calcUncoveredIndex = 0;
                 calcCurrentCoverage = 0;
             }
@@ -476,7 +493,8 @@ public final class TorchPlannerHack extends Hack
         calcBestCoverage = 0;
         calcRoundChecksDone = 0;
         calcRoundChecksTotal = 0;
-        coverageCache.clear();
+        coverageTrueCache.clear();
+        coverageFalseCache.clear();
     }
 
     private int getCalculationPercent()
@@ -530,11 +548,15 @@ public final class TorchPlannerHack extends Hack
         if(dx + dy + dz > TORCH_LIGHT_RADIUS)
             return false;
 
-        CoverageKey key =
-            new CoverageKey(torchPos.asLong(), spawnableSpot.asLong());
-        Boolean cached = coverageCache.get(key);
-        if(cached != null)
-            return cached;
+        long torchPosLong = torchPos.asLong();
+        long spawnPosLong = spawnableSpot.asLong();
+        HashSet<Long> coveredSpots = coverageTrueCache.get(torchPosLong);
+        if(coveredSpots != null && coveredSpots.contains(spawnPosLong))
+            return true;
+
+        HashSet<Long> blockedSpots = coverageFalseCache.get(torchPosLong);
+        if(blockedSpots != null && blockedSpots.contains(spawnPosLong))
+            return false;
 
         // Prevent counting spots that are only reachable through walls.
         Vec3 torchCenter = new Vec3(torchPos.getX() + 0.5, torchPos.getY() + 0.6,
@@ -542,12 +564,15 @@ public final class TorchPlannerHack extends Hack
         Vec3 spawnCenter = new Vec3(spawnableSpot.getX() + 0.5,
             spawnableSpot.getY() + 1.0, spawnableSpot.getZ() + 0.5);
         boolean covered = BlockUtils.hasLineOfSight(torchCenter, spawnCenter);
-        coverageCache.put(key, covered);
-        return covered;
-    }
 
-    private static record CoverageKey(long torchPosLong, long spawnPosLong)
-    {
+        if(covered)
+            coverageTrueCache.computeIfAbsent(torchPosLong, k -> new HashSet<>())
+                .add(spawnPosLong);
+        else
+            coverageFalseCache.computeIfAbsent(torchPosLong, k -> new HashSet<>())
+                .add(spawnPosLong);
+
+        return covered;
     }
 
     private static enum Step
