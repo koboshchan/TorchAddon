@@ -12,7 +12,7 @@ import com.kobosh.torchaddon.client.hack.TorchPlannerHack;
 public class WurstAddonHackAddon implements Addon {
 
     private final Hack[] hacks = {
-        new ExampleHack(),
+        // new ExampleHack(),
         new TorchPlannerHack()
     };
 
