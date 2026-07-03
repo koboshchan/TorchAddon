@@ -4,10 +4,10 @@ pluginManagement {
             name = 'Fabric'
             url = 'https://maven.fabricmc.net/'
         }
+        mavenCentral()
         gradlePluginPortal()
     }
 }
 
 // Include Wurst7 as a composite build for proper dependency resolution
 includeBuild 'wurst7-base'
-
