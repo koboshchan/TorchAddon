@@ -15,11 +15,11 @@ import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.blaze3d.vertex.PoseStack;
 
 import net.minecraft.client.gui.Font;
-import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.util.CommonColors;
-import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.EntityTypes;
 import net.minecraft.world.entity.SpawnPlacements;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -218,7 +218,7 @@ public final class TorchPlannerHack extends Hack
     }
 
     @Override
-    public void onRenderGUI(GuiGraphics context, float partialTicks)
+    public void onRenderGUI(GuiGraphicsExtractor context, float partialTicks)
     {
         if(step == Step.DONE)
             return;
@@ -238,7 +238,7 @@ public final class TorchPlannerHack extends Hack
         int msgY2 = msgY1 + 10;
 
         context.fill(msgX1, msgY1, msgX2, msgY2, 0x80000000);
-        context.drawString(tr, message, msgX1 + 2, msgY1 + 1,
+        context.text(tr, message, msgX1 + 2, msgY1 + 1,
             CommonColors.WHITE, false);
     }
 
@@ -422,7 +422,7 @@ public final class TorchPlannerHack extends Hack
 
         for(BlockPos pos : BlockUtils.getAllInBox(selected.min(), selected.max()))
         {
-            if(!SpawnPlacements.isSpawnPositionOk(EntityType.CREEPER, MC.level, pos))
+            if(!SpawnPlacements.isSpawnPositionOk(EntityTypes.CREEPER, MC.level, pos))
                 continue;
 
             spawnableSpots.add(pos.immutable());
