@@ -145,6 +145,9 @@ public final class TorchPlannerHack extends Hack
             pollAsyncSolve();
     }
 
+    // Wurst 26.3 RenderUtils uses Mojang RenderSetup pipelines and RenderPass.
+    // Keep both depth-tested selection bounds and through-wall colored markers
+    // here, without backend-specific state changes (including on Vulkan).
     @Override
     public void onRender(PoseStack matrixStack, float partialTicks)
     {

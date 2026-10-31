@@ -124,3 +124,26 @@ jar {
 }
 
 test { useJUnitPlatform() }
+
+// Check compiled references, not just imports (fully-qualified/static calls count).
+// Keep the addon on Mojang/Wurst's backend-independent rendering path.
+def verifyBackendIndependentRendering = tasks.register('verifyBackendIndependentRendering') {
+    dependsOn tasks.named('classes'), tasks.named('clientClasses')
+    def classDirs = files(sourceSets.main.output.classesDirs, sourceSets.client.output.classesDirs)
+    inputs.files(classDirs)
+    doLast {
+        def forbidden = [
+            'org/lwjgl/opengl/', 'org/lwjgl/vulkan/',
+            'com/mojang/blaze3d/opengl/',
+            'com/mojang/blaze3d/platform/GlStateManager'
+        ]
+        classDirs.asFileTree.matching { include '**/*.class' }.each { compiled ->
+            def constants = new String(compiled.bytes, java.nio.charset.StandardCharsets.ISO_8859_1)
+            forbidden.each { api ->
+                if (constants.contains(api))
+                    throw new GradleException("Backend-specific rendering reference ${api} in ${compiled}")
+            }
+        }
+    }
+}
+tasks.named('check') { dependsOn verifyBackendIndependentRendering }
