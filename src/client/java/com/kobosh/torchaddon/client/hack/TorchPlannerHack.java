@@ -1,14 +1,15 @@
 package com.kobosh.torchaddon.client.hack;
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.HashMap;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import com.kobosh.torchaddon.LightPlanner;
+import com.kobosh.torchaddon.LightPlanner.Point;
+import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.WallTorchBlock;
+import net.minecraft.world.level.lighting.LightEngine;
 
 import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.blaze3d.vertex.PoseStack;
@@ -33,7 +34,6 @@ import net.wurstclient.events.UpdateListener;
 import net.wurstclient.hack.Hack;
 import net.wurstclient.settings.SliderSetting;
 import net.wurstclient.settings.SliderSetting.ValueDisplay;
-import net.wurstclient.util.BlockUtils;
 import net.wurstclient.util.ChatUtils;
 import net.wurstclient.util.RenderUtils;
 
@@ -41,7 +41,6 @@ import net.wurstclient.util.RenderUtils;
 public final class TorchPlannerHack extends Hack
     implements UpdateListener, RenderListener, GUIRenderListener
 {
-    private static final int TORCH_LIGHT_RADIUS = 13;
     private static final int MAX_SELECTION_VOLUME = 524288;
 
     private final SliderSetting checksPerTick =
@@ -60,23 +59,20 @@ public final class TorchPlannerHack extends Hack
     private int uncoveredSpawnableCount;
 
     private CalcPhase calcPhase = CalcPhase.IDLE;
-    private ArrayList<CandidateCoverage> calcCandidates = new ArrayList<>();
-    private HashSet<Long> calcUncovered = new HashSet<>();
-    private int calcTotalSpawnable;
-    private int calcCoveredSpawnable;
-    private int calcCandidateIndex;
-    private CandidateCoverage calcCurrentCandidate;
-    private int calcCurrentSpotIndex;
-    private int calcCurrentCoverage;
-    private CandidateCoverage calcBestCandidate;
-    private int calcBestCoverage;
-    private long calcRoundChecksDone;
-    private long calcRoundChecksTotal;
-    private CompletableFuture<SolveResult> solveFuture;
-    private final AtomicInteger asyncPercent = new AtomicInteger(0);
-    private final Map<Long, HashSet<Long>> coverageTrueCache = new HashMap<>();
-    private final Map<Long, HashSet<Long>> coverageFalseCache =
-        new HashMap<>();
+    private Iterator<BlockPos> scan;
+    private Selection walkBounds;
+    private final Set<Point> targets = new HashSet<>();
+    private final Set<BlockPos> walkable = new HashSet<>();
+    private final Set<BlockPos> reachable = new HashSet<>();
+    private final ArrayDeque<BlockPos> reachQueue = new ArrayDeque<>();
+    private final ArrayList<BlockPos> placements = new ArrayList<>();
+    private final ArrayList<LightPlanner.Candidate> coverages = new ArrayList<>();
+    private int candidateIndex;
+    private int targetCount;
+    private int coverageEntries;
+    private LightPlanner.Spread spread;
+    private CompletableFuture<LightPlanner.Result> solveFuture;
+    private AtomicBoolean cancelled = new AtomicBoolean();
 
     public TorchPlannerHack()
     {
@@ -134,6 +130,12 @@ public final class TorchPlannerHack extends Hack
     @Override
     public void onUpdate()
     {
+        if(MC.level == null || MC.player == null)
+        {
+            setEnabled(false);
+            return;
+        }
+        if(step == null) return;
         if(step.selectPos)
             handlePositionSelection();
         else if(step == Step.CALCULATE)
@@ -146,6 +148,7 @@ public final class TorchPlannerHack extends Hack
     @Override
     public void onRender(PoseStack matrixStack, float partialTicks)
     {
+        if(MC.level == null || MC.player == null || step == null) return;
         int black = 0x80000000;
         int hovered = 0x26404040;
         int selected = 0x2600FF00;
@@ -219,7 +222,7 @@ public final class TorchPlannerHack extends Hack
     @Override
     public void onRenderGUI(GuiGraphicsExtractor context, float partialTicks)
     {
-        if(step == Step.DONE)
+        if(step == null || step == Step.DONE)
             return;
 
         String message;
@@ -268,562 +271,321 @@ public final class TorchPlannerHack extends Hack
             step.pos = posLookingAt;
     }
 
+    private static Point point(BlockPos pos)
+    {
+        return new Point(pos.getX(), pos.getY(), pos.getZ());
+    }
+
+    private static BlockPos block(Point p)
+    {
+        return new BlockPos(p.x(), p.y(), p.z());
+    }
+
     private void calculateSuggestions()
     {
+        // Both settings retain their old names/ranges, so existing Wurst config survives.
+        // No world reads happen on the asynchronous set-cover worker.
+        int budget = checksPerTick.getValueI();
+        long deadline = System.nanoTime() + 8_000_000L;
         if(calcPhase == CalcPhase.IDLE)
         {
             selection = new Selection(Step.START_POS.pos, Step.END_POS.pos);
             Step.START_POS.pos = null;
             Step.END_POS.pos = null;
-
             if(selection.volume() > MAX_SELECTION_VOLUME)
             {
-                ChatUtils.error("Selection is too large. Please select up to "
+                ChatUtils.error("Selection is too large. Select up to "
                     + MAX_SELECTION_VOLUME + " blocks.");
                 setEnabled(false);
                 return;
             }
-
-            List<BlockPos> spawnableSpots = collectSpawnableSpots(selection);
-            if(spawnableSpots.isEmpty())
+            walkBounds = new Selection(selection.min().offset(-5, -2, -5),
+                selection.max().offset(5, 2, 5));
+            if(walkBounds.volume() > MAX_SELECTION_VOLUME * 4L)
             {
-                suggestedTorches.clear();
-                uncoveredSpawnableCount = 0;
-                step = Step.DONE;
-                ChatUtils.message(
-                    "TorchPlanner: No hostile spawn spots found in selection.");
+                ChatUtils.error("Selection is too thin/large to scan safely.");
+                setEnabled(false);
                 return;
             }
-
-            Map<Long, Integer> spawnBuckets = buildSpawnBuckets(spawnableSpots);
-            ArrayList<BlockPos> candidates =
-                collectTorchCandidates(selection, spawnBuckets);
-            if(candidates.isEmpty())
-            {
-                suggestedTorches.clear();
-                uncoveredSpawnableCount = spawnableSpots.size();
-                step = Step.DONE;
-                ChatUtils.error(
-                    "TorchPlanner: No valid torch placement blocks found in selection.");
-                return;
-            }
-
-            suggestedTorches.clear();
-            calcCandidates = buildCandidateCoverages(candidates, spawnableSpots);
-            if(calcCandidates.isEmpty())
-            {
-                uncoveredSpawnableCount = spawnableSpots.size();
-                step = Step.DONE;
-                ChatUtils.error(
-                    "TorchPlanner: No candidate can cover spawn spots in this selection.");
-                return;
-            }
-
-            calcUncovered.clear();
-            for(BlockPos spot : spawnableSpots)
-                calcUncovered.add(spot.asLong());
-
-            coverageTrueCache.clear();
-            coverageFalseCache.clear();
-            calcTotalSpawnable = spawnableSpots.size();
-            calcCoveredSpawnable = 0;
-
-            ArrayList<CandidateCoverage> workerCandidates =
-                new ArrayList<>(calcCandidates);
-            HashSet<Long> workerUncovered = new HashSet<>(calcUncovered);
-            asyncPercent.set(0);
-            solveFuture = CompletableFuture.supplyAsync(() ->
-                solveGreedyWorker(workerCandidates, workerUncovered,
-                    calcTotalSpawnable, asyncPercent));
-            calcPhase = CalcPhase.ASYNC_RUNNING;
-            return;
+            scan = BlockPos.betweenClosed(walkBounds.min(), walkBounds.max()).iterator();
+            calcPhase = CalcPhase.SCAN;
         }
+
+        while(budget > 0 && System.nanoTime() < deadline)
+        {
+            if(calcPhase == CalcPhase.SCAN)
+            {
+                if(scan.hasNext())
+                {
+                    BlockPos pos = scan.next().immutable();
+                    budget -= 32;
+                    if(!MC.level.isLoaded(pos) || !MC.level.isLoaded(pos.above())
+                        || !MC.level.isLoaded(pos.below()))
+                        continue;
+                    if(isWalkable(pos)) walkable.add(pos);
+                    if(!contains(selection, pos)) continue;
+                    // Creeper placement checks geometry, not darkness. Use measured BLOCK
+                    // light so daylight does not hide nighttime risks and existing lights count.
+                    if(LightPlanner.needsLighting(
+                        SpawnPlacements.isSpawnPositionOk(EntityTypes.CREEPER, MC.level, pos),
+                        MC.level.getBrightness(LightLayer.BLOCK, pos)))
+                        targets.add(point(pos));
+                    if(MC.level.getBlockState(pos).isAir()
+                        && MC.level.getFluidState(pos).isEmpty()
+                        && !supportDirections(pos).isEmpty())
+                        placements.add(pos);
+                    continue;
+                }
+                targetCount = targets.size();
+                if(targets.isEmpty())
+                {
+                    finish(new LightPlanner.Result(List.of(), 0));
+                    return;
+                }
+                BlockPos start = MC.player.blockPosition();
+                if(walkable.contains(start))
+                {
+                    reachable.add(start);
+                    reachQueue.add(start);
+                }
+                calcPhase = CalcPhase.REACH;
+            }
+            if(calcPhase == CalcPhase.REACH)
+            {
+                if(!reachQueue.isEmpty())
+                {
+                    BlockPos from = reachQueue.removeFirst();
+                    budget -= 128;
+                    for(Direction dir : Direction.Plane.HORIZONTAL)
+                        for(int dy = -1; dy <= 1; dy++)
+                        {
+                            BlockPos to = from.relative(dir).offset(0, dy, 0);
+                            if(!walkable.contains(to) || reachable.contains(to)
+                                || !canWalkBetween(from, to)) continue;
+                            reachable.add(to);
+                            reachQueue.add(to);
+                        }
+                    continue;
+                }
+                calcPhase = CalcPhase.COVERAGE;
+            }
+            if(calcPhase == CalcPhase.COVERAGE)
+            {
+                if(candidateIndex >= placements.size())
+                {
+                    List<LightPlanner.Candidate> snapshot = List.copyOf(coverages);
+                    Set<Point> targetSnapshot = Set.copyOf(targets);
+                    AtomicBoolean cancellation = cancelled;
+                    solveFuture = CompletableFuture.supplyAsync(() ->
+                        LightPlanner.solve(snapshot, targetSnapshot, cancellation::get));
+                    calcPhase = CalcPhase.ASYNC_RUNNING;
+                    return;
+                }
+                BlockPos candidate = placements.get(candidateIndex);
+                if(spread == null)
+                {
+                    budget -= 1000;
+                    if(!hasReachablePlacement(candidate))
+                    {
+                        candidateIndex++;
+                        continue;
+                    }
+                    spread = new LightPlanner.Spread(point(candidate));
+                }
+                // Bounded work slices keep even wall-heavy selections responsive.
+                int slice = Math.min(budget, 384);
+                budget -= slice;
+                if(!spread.advance(this::lightLoss, slice)) continue;
+                Set<Point> covered = new HashSet<>();
+                // Flood fill is local (radius 13), avoid scanning every selected target.
+                Point center = point(candidate);
+                for(int dx = -13; dx <= 13; dx++)
+                    for(int dy = -13 + Math.abs(dx); dy <= 13 - Math.abs(dx); dy++)
+                    {
+                        int remaining = 13 - Math.abs(dx) - Math.abs(dy);
+                        for(int dz = -remaining; dz <= remaining; dz++)
+                        {
+                            Point p = center.offset(dx, dy, dz);
+                            if(targets.contains(p) && spread.lightAt(p) > 0)
+                                covered.add(p);
+                        }
+                    }
+                coverageEntries += covered.size();
+                if(coverageEntries > 4_000_000)
+                {
+                    ChatUtils.error("TorchPlanner: Coverage map is too large. Select a smaller area.");
+                    setEnabled(false);
+                    return;
+                }
+                if(!covered.isEmpty())
+                    coverages.add(new LightPlanner.Candidate(center, covered));
+                spread = null;
+                candidateIndex++;
+            }
+            if(calcPhase == CalcPhase.ASYNC_RUNNING) return;
+        }
+    }
+
+    private static boolean contains(Selection box, BlockPos pos)
+    {
+        return pos.getX() >= box.min().getX() && pos.getX() <= box.max().getX()
+            && pos.getY() >= box.min().getY() && pos.getY() <= box.max().getY()
+            && pos.getZ() >= box.min().getZ() && pos.getZ() <= box.max().getZ();
+    }
+
+    private boolean isWalkable(BlockPos feet)
+    {
+        BlockPos below = feet.below();
+        return MC.level.getFluidState(feet).isEmpty()
+            && MC.level.getBlockState(below).isFaceSturdy(MC.level, below, Direction.UP)
+            && MC.level.noCollision(MC.player, bodyAt(feet));
+    }
+
+    private AABB bodyAt(BlockPos feet)
+    {
+        double half = MC.player.getBbWidth() / 2.0;
+        return new AABB(feet.getX() + 0.5 - half, feet.getY(),
+            feet.getZ() + 0.5 - half, feet.getX() + 0.5 + half,
+            feet.getY() + MC.player.getBbHeight(), feet.getZ() + 0.5 + half);
+    }
+
+    private boolean canWalkBetween(BlockPos from, BlockPos to)
+    {
+        // Test the raised sweep as well as both landing positions, preventing
+        // diagonal/corner clipping and jumps through ceilings. No ladders/flying.
+        int top = Math.max(from.getY(), to.getY());
+        AABB sweep = bodyAt(new BlockPos(from.getX(), top, from.getZ()))
+            .minmax(bodyAt(new BlockPos(to.getX(), top, to.getZ())));
+        return MC.level.noCollision(MC.player, sweep);
+    }
+
+    private List<Direction> supportDirections(BlockPos pos)
+    {
+        ArrayList<Direction> result = new ArrayList<>();
+        if(Blocks.TORCH.defaultBlockState().canSurvive(MC.level, pos))
+            result.add(Direction.DOWN);
+        for(Direction facing : Direction.Plane.HORIZONTAL)
+            if(Blocks.WALL_TORCH.defaultBlockState()
+                .setValue(WallTorchBlock.FACING, facing).canSurvive(MC.level, pos))
+                result.add(facing.getOpposite());
+        return result;
+    }
+
+    private boolean hasReachablePlacement(BlockPos pos)
+    {
+        // A plan is not limited to the player's current reach, but every position
+        // needs a reachable stance and a real visible, in-range supporting face.
+        double range = Math.min(6, MC.player.blockInteractionRange());
+        int radius = (int)Math.ceil(range);
+        List<Direction> supports = supportDirections(pos);
+        for(int dx = -radius; dx <= radius; dx++)
+            for(int dy = -radius - 2; dy <= radius; dy++)
+                for(int dz = -radius; dz <= radius; dz++)
+                {
+                    BlockPos stance = pos.offset(dx, dy, dz);
+                    if(!reachable.contains(stance)) continue;
+                    Vec3 eye = Vec3.atBottomCenterOf(stance)
+                        .add(0, MC.player.getEyeHeight(), 0);
+                    for(Direction support : supports)
+                    {
+                        BlockPos neighbor = pos.relative(support);
+                        Direction face = support.getOpposite();
+                        Vec3 hit = Vec3.atCenterOf(neighbor).add(
+                            face.getStepX() * 0.4999, face.getStepY() * 0.4999,
+                            face.getStepZ() * 0.4999);
+                        if(eye.distanceToSqr(hit) > range * range) continue;
+                        BlockHitResult ray = MC.level.clip(new ClipContext(eye, hit,
+                            ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, MC.player));
+                        if(ray.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK
+                            && ray.getBlockPos().equals(neighbor)
+                            && ray.getDirection() == face)
+                            return true;
+                    }
+                }
+        return false;
+    }
+
+    private int lightLoss(Point from, Point to)
+    {
+        BlockPos a = block(from), b = block(to);
+        if(!MC.level.isLoaded(a) || !MC.level.isLoaded(b)) return 16;
+        BlockState source = MC.level.getBlockState(a);
+        BlockState dest = MC.level.getBlockState(b);
+        Direction direction = Direction.getNearest(to.x() - from.x(),
+            to.y() - from.y(), to.z() - from.z(), Direction.UP);
+        // Vanilla's own 26.3 dampening and voxel-face occlusion rules.
+        return LightEngine.getLightDampeningInto(source, dest, direction,
+            Math.max(1, dest.getLightDampening()));
     }
 
     private void pollAsyncSolve()
     {
-        if(solveFuture == null || !solveFuture.isDone())
-            return;
-
-        SolveResult result;
-        try
+        if(solveFuture == null || !solveFuture.isDone()) return;
+        try { finish(solveFuture.join()); }
+        catch(RuntimeException e)
         {
-            result = solveFuture.join();
-
-        }catch(RuntimeException e)
-        {
-            ChatUtils.error("TorchPlanner: Solve failed.");
-            resetCalculationState();
+            ChatUtils.error("TorchPlanner: Solve failed. Select the area again.");
             setEnabled(false);
-            return;
         }
+    }
 
+    private void finish(LightPlanner.Result result)
+    {
         suggestedTorches.clear();
-        suggestedTorches.addAll(result.positions());
-        uncoveredSpawnableCount = result.uncoveredCount();
-        calcCoveredSpawnable = calcTotalSpawnable - uncoveredSpawnableCount;
+        for(Point p : result.positions()) suggestedTorches.add(block(p));
+        uncoveredSpawnableCount = result.uncovered();
         step = Step.DONE;
         ChatUtils.message("TorchPlanner: Suggested " + suggestedTorches.size()
-            + " torch positions for " + calcTotalSpawnable + " spawnable spots."
-            + (uncoveredSpawnableCount > 0
-                ? " " + uncoveredSpawnableCount + " spots remain uncovered."
-                : ""));
-        resetCalculationState();
-    }
-
-    private static SolveResult solveGreedyWorker(
-        ArrayList<CandidateCoverage> candidates, HashSet<Long> uncovered,
-        int totalSpawnable, AtomicInteger progress)
-    {
-        ArrayList<BlockPos> chosen = new ArrayList<>();
-
-        while(!uncovered.isEmpty() && !candidates.isEmpty())
-        {
-            CandidateScore best = candidates.parallelStream()
-                .map(c -> new CandidateScore(c, countCoverage(c, uncovered)))
-                .max(Comparator.comparingInt(CandidateScore::coverage)).orElse(null);
-
-            if(best == null || best.coverage() <= 0)
-                break;
-
-            CandidateCoverage bestCandidate = best.candidate();
-            chosen.add(bestCandidate.pos());
-            candidates.remove(bestCandidate);
-
-            for(long spot : bestCandidate.spotLongs())
-                uncovered.remove(spot);
-
-            if(totalSpawnable > 0)
-            {
-                int covered = totalSpawnable - uncovered.size();
-                int percent = (int)Math.floor((double)covered * 100.0 / totalSpawnable);
-                progress.set(Math.min(99, Math.max(0, percent)));
-            }
-        }
-
-        progress.set(100);
-        return new SolveResult(chosen, uncovered.size());
-    }
-
-    private static int countCoverage(CandidateCoverage candidate,
-        HashSet<Long> uncovered)
-    {
-        int count = 0;
-        for(long spot : candidate.spotLongs())
-            if(uncovered.contains(spot))
-                count++;
-        return count;
-    }
-
-    private List<BlockPos> collectSpawnableSpots(Selection selected)
-    {
-        ArrayList<BlockPos> spawnableSpots = new ArrayList<>();
-
-        for(BlockPos pos : BlockUtils.getAllInBox(selected.min(), selected.max()))
-        {
-            if(!SpawnPlacements.isSpawnPositionOk(EntityTypes.CREEPER, MC.level, pos))
-                continue;
-
-            spawnableSpots.add(pos.immutable());
-        }
-
-        return spawnableSpots;
-    }
-
-    private ArrayList<BlockPos> collectTorchCandidates(Selection selected,
-        Map<Long, Integer> spawnBuckets)
-    {
-        ArrayList<BlockPos> candidates = new ArrayList<>();
-
-        for(BlockPos pos : BlockUtils.getAllInBox(selected.min(), selected.max()))
-        {
-            BlockState state = MC.level.getBlockState(pos);
-            if(!state.isAir() || !MC.level.getFluidState(pos).isEmpty())
-                continue;
-
-            BlockPos below = pos.below();
-            BlockState belowState = MC.level.getBlockState(below);
-            boolean hasFloorSupport =
-                belowState.isFaceSturdy(MC.level, below, Direction.UP);
-            boolean hasWallSupport = false;
-
-            for(Direction direction : Direction.Plane.HORIZONTAL)
-            {
-                BlockPos sidePos = pos.relative(direction);
-                BlockState sideState = MC.level.getBlockState(sidePos);
-                if(!sideState.isFaceSturdy(MC.level, sidePos,
-                    direction.getOpposite()))
-                    continue;
-
-                hasWallSupport = true;
-                break;
-            }
-
-            if(!hasFloorSupport && !hasWallSupport)
-                continue;
-
-            if(!hasNearbySpawnBucket(pos, spawnBuckets))
-                continue;
-
-            candidates.add(pos.immutable());
-        }
-
-        return candidates;
-    }
-
-    private Map<Long, Integer> buildSpawnBuckets(List<BlockPos> spawnableSpots)
-    {
-        HashMap<Long, Integer> buckets = new HashMap<>();
-
-        for(BlockPos spot : spawnableSpots)
-        {
-            long key = bucketKey(spot.getX(), spot.getY(), spot.getZ());
-            buckets.merge(key, 1, Integer::sum);
-        }
-
-        return buckets;
-    }
-
-    private Map<Long, ArrayList<BlockPos>> buildSpawnSpotBuckets(
-        List<BlockPos> spawnableSpots)
-    {
-        HashMap<Long, ArrayList<BlockPos>> buckets = new HashMap<>();
-
-        for(BlockPos spot : spawnableSpots)
-        {
-            long key = bucketKey(spot.getX(), spot.getY(), spot.getZ());
-            buckets.computeIfAbsent(key, k -> new ArrayList<>()).add(spot);
-        }
-
-        return buckets;
-    }
-
-    private ArrayList<CandidateCoverage> buildCandidateCoverages(
-        ArrayList<BlockPos> candidates, List<BlockPos> spawnableSpots)
-    {
-        Map<Long, ArrayList<BlockPos>> spawnBuckets =
-            buildSpawnSpotBuckets(spawnableSpots);
-        ArrayList<CandidateCoverage> result = new ArrayList<>(candidates.size());
-
-        for(BlockPos candidate : candidates)
-        {
-            ArrayList<Long> covered = getCoveredSpawnSpots(candidate, spawnBuckets);
-            if(covered.isEmpty())
-                continue;
-
-            result.add(new CandidateCoverage(candidate, toLongArray(covered)));
-        }
-
-        return result;
-    }
-
-    private ArrayList<Long> getCoveredSpawnSpots(BlockPos candidate,
-        Map<Long, ArrayList<BlockPos>> spawnBuckets)
-    {
-        ArrayList<Long> covered = new ArrayList<>();
-
-        int bx = floorDiv(candidate.getX(), 8);
-        int by = floorDiv(candidate.getY(), 8);
-        int bz = floorDiv(candidate.getZ(), 8);
-
-        for(int y = by - 2; y <= by + 2; y++)
-            for(int z = bz - 2; z <= bz + 2; z++)
-                for(int x = bx - 2; x <= bx + 2; x++)
-                {
-                    ArrayList<BlockPos> spots =
-                        spawnBuckets.get(bucketKeyFromBuckets(x, y, z));
-                    if(spots == null)
-                        continue;
-
-                    for(BlockPos spot : spots)
-                        if(isCoveredByTorch(spot, candidate))
-                            covered.add(spot.asLong());
-                }
-
-        return covered;
-    }
-
-    private static long[] toLongArray(ArrayList<Long> values)
-    {
-        long[] arr = new long[values.size()];
-        for(int i = 0; i < values.size(); i++)
-            arr[i] = values.get(i);
-        return arr;
-    }
-
-    private boolean hasNearbySpawnBucket(BlockPos pos,
-        Map<Long, Integer> spawnBuckets)
-    {
-        int bx = floorDiv(pos.getX(), 8);
-        int by = floorDiv(pos.getY(), 8);
-        int bz = floorDiv(pos.getZ(), 8);
-
-        // Radius 13 can reach into buckets up to +/-2 in each axis.
-        for(int y = by - 2; y <= by + 2; y++)
-            for(int z = bz - 2; z <= bz + 2; z++)
-                for(int x = bx - 2; x <= bx + 2; x++)
-                    if(spawnBuckets.containsKey(bucketKeyFromBuckets(x, y, z)))
-                        return true;
-
-        return false;
-    }
-
-    private static long bucketKey(int x, int y, int z)
-    {
-        return bucketKeyFromBuckets(floorDiv(x, 8), floorDiv(y, 8),
-            floorDiv(z, 8));
-    }
-
-    private static long bucketKeyFromBuckets(int bx, int by, int bz)
-    {
-        long lx = ((long)bx) & 0x1FFFFFL;
-        long ly = ((long)by) & 0x1FFFFFL;
-        long lz = ((long)bz) & 0x1FFFFFL;
-        return (lx << 42) | (ly << 21) | lz;
-    }
-
-    private static int floorDiv(int value, int div)
-    {
-        int result = value / div;
-        if((value ^ div) < 0 && result * div != value)
-            result--;
-        return result;
-    }
-
-    private void startBestCandidateSearchRound()
-    {
-        calcCandidateIndex = 0;
-        calcCurrentCandidate = null;
-        calcCurrentSpotIndex = 0;
-        calcCurrentCoverage = 0;
-        calcBestCandidate = null;
-        calcBestCoverage = 0;
-        calcRoundChecksDone = 0;
-
-        long totalChecks = 0;
-        for(CandidateCoverage candidate : calcCandidates)
-            totalChecks += candidate.spotLongs().length;
-        calcRoundChecksTotal = totalChecks;
-    }
-
-    private void processBestCandidateSearch()
-    {
-        int checksLeft = checksPerTick.getValueI();
-
-        while(checksLeft > 0 && calcCandidateIndex < calcCandidates.size())
-        {
-            if(calcCurrentCandidate == null)
-            {
-                calcCurrentCandidate = calcCandidates.get(calcCandidateIndex);
-                calcCurrentSpotIndex = 0;
-                calcCurrentCoverage = 0;
-
-                if(calcCurrentCandidate.spotLongs().length <= calcBestCoverage)
-                {
-                    calcCandidateIndex++;
-                    calcCurrentCandidate = null;
-                    continue;
-                }
-            }
-
-            long[] spots = calcCurrentCandidate.spotLongs();
-
-            while(checksLeft > 0 && calcCurrentSpotIndex < spots.length)
-            {
-                int remainingSpots = spots.length - calcCurrentSpotIndex;
-                if(calcCurrentCoverage + remainingSpots <= calcBestCoverage)
-                {
-                    // Branch-and-bound: this candidate cannot beat the current
-                    // best even if all remaining spots were covered.
-                    calcRoundChecksDone += remainingSpots;
-                    calcCurrentSpotIndex = spots.length;
-                    break;
-                }
-
-                if(calcUncovered.contains(spots[calcCurrentSpotIndex]))
-                    calcCurrentCoverage++;
-
-                calcCurrentSpotIndex++;
-                calcRoundChecksDone++;
-                checksLeft--;
-            }
-
-            if(calcCurrentSpotIndex >= spots.length)
-            {
-                if(calcCurrentCoverage > calcBestCoverage)
-                {
-                    calcBestCoverage = calcCurrentCoverage;
-                    calcBestCandidate = calcCurrentCandidate;
-                }
-
-                if(calcCurrentCoverage == 0)
-                    calcCandidates.remove(calcCandidateIndex);
-                else
-                    calcCandidateIndex++;
-
-                calcCurrentCandidate = null;
-                calcCurrentSpotIndex = 0;
-                calcCurrentCoverage = 0;
-            }
-        }
-
-        if(calcCandidateIndex >= calcCandidates.size())
-        {
-            if(calcBestCandidate == null || calcBestCoverage == 0)
-            {
-                finalizeCalculation();
-                return;
-            }
-
-            calcPhase = CalcPhase.APPLY_BEST;
-        }
-    }
-
-    private void applyBestCandidate()
-    {
-        suggestedTorches.add(calcBestCandidate.pos());
-        calcCandidates.remove(calcBestCandidate);
-
-        int removedThisRound = 0;
-        for(long spotLong : calcBestCandidate.spotLongs())
-        {
-            if(calcUncovered.remove(spotLong))
-                removedThisRound++;
-        }
-
-        calcCoveredSpawnable += removedThisRound;
-
-        if(calcUncovered.isEmpty())
-        {
-            finalizeCalculation();
-            return;
-        }
-
-        if(calcCandidates.isEmpty())
-        {
-            finalizeCalculation();
-            return;
-        }
-
-        startBestCandidateSearchRound();
-        calcPhase = CalcPhase.SEARCH_BEST;
-    }
-
-    private void finalizeCalculation()
-    {
-        uncoveredSpawnableCount = calcUncovered.size();
-        step = Step.DONE;
-        ChatUtils.message("TorchPlanner: Suggested " + suggestedTorches.size()
-            + " torch positions for " + calcTotalSpawnable + " spawnable spots."
-            + (uncoveredSpawnableCount > 0
-                ? " " + uncoveredSpawnableCount + " spots remain uncovered."
-                : ""));
+            + " normal torches for " + targetCount + " dark spawnable spots."
+            + (uncoveredSpawnableCount > 0 ? " " + uncoveredSpawnableCount
+                + " remain uncovered (no reachable placement/light path)." : "")
+            + " Recalculate after changing terrain or lighting.");
         resetCalculationState();
     }
 
     private void resetCalculationState()
     {
-        if(solveFuture != null && !solveFuture.isDone())
-            solveFuture.cancel(true);
-
-        calcPhase = CalcPhase.IDLE;
-        calcCandidates.clear();
-        calcUncovered.clear();
-        calcTotalSpawnable = 0;
-        calcCoveredSpawnable = 0;
-        calcCandidateIndex = 0;
-        calcCurrentCandidate = null;
-        calcCurrentSpotIndex = 0;
-        calcCurrentCoverage = 0;
-        calcBestCandidate = null;
-        calcBestCoverage = 0;
-        calcRoundChecksDone = 0;
-        calcRoundChecksTotal = 0;
+        cancelled.set(true);
+        if(solveFuture != null) solveFuture.cancel(true);
+        cancelled = new AtomicBoolean();
         solveFuture = null;
-        asyncPercent.set(0);
-        coverageTrueCache.clear();
-        coverageFalseCache.clear();
+        calcPhase = CalcPhase.IDLE;
+        scan = null;
+        walkBounds = null;
+        targets.clear();
+        walkable.clear();
+        reachable.clear();
+        reachQueue.clear();
+        placements.clear();
+        coverages.clear();
+        spread = null;
+        candidateIndex = 0;
+        targetCount = 0;
+        coverageEntries = 0;
     }
 
     private int getCalculationPercent()
     {
-        if(calcTotalSpawnable <= 0)
-            return 0;
-
-        if(calcPhase == CalcPhase.ASYNC_RUNNING)
-            return Math.min(99, Math.max(0, asyncPercent.get()));
-
-        double coveredRatio = (double)calcCoveredSpawnable / calcTotalSpawnable;
-        int basePercent = (int)Math.floor(coveredRatio * 100.0);
-
-        if(calcPhase == CalcPhase.SEARCH_BEST && calcRoundChecksTotal > 0)
-        {
-            double roundRatio =
-                Math.min(1.0, (double)calcRoundChecksDone / calcRoundChecksTotal);
-            int blended =
-                basePercent + (int)Math.floor((100 - basePercent) * roundRatio * 0.25);
-            return Math.min(99, Math.max(0, blended));
-        }
-
-        if(calcPhase == CalcPhase.APPLY_BEST)
-            return Math.min(99, Math.max(0, basePercent));
-
-        return Math.min(100, Math.max(0, basePercent));
+        if(calcPhase == CalcPhase.COVERAGE)
+            return 20 + (int)(79L * candidateIndex / Math.max(1, placements.size()));
+        if(calcPhase == CalcPhase.ASYNC_RUNNING) return 99;
+        if(calcPhase == CalcPhase.REACH) return 10;
+        return 0;
     }
 
     private int getRemainingSuggestionCount()
     {
         int remaining = 0;
-
         for(BlockPos pos : suggestedTorches)
-            if(!isSuggestionCompleted(pos))
-                remaining++;
-
+            if(!isSuggestionCompleted(pos)) remaining++;
         return remaining;
     }
 
     private boolean isSuggestionCompleted(BlockPos pos)
     {
         BlockState state = MC.level.getBlockState(pos);
-        return state.is(Blocks.TORCH) || state.is(Blocks.WALL_TORCH)
-            || state.is(Blocks.SOUL_TORCH) || state.is(Blocks.SOUL_WALL_TORCH)
-            || state.is(Blocks.REDSTONE_TORCH)
-            || state.is(Blocks.REDSTONE_WALL_TORCH);
-    }
-
-    private boolean isCoveredByTorch(BlockPos spawnableSpot, BlockPos torchPos)
-    {
-        int dx = Math.abs(spawnableSpot.getX() - torchPos.getX());
-        int dy = Math.abs(spawnableSpot.getY() - torchPos.getY());
-        int dz = Math.abs(spawnableSpot.getZ() - torchPos.getZ());
-        if(dx + dy + dz > TORCH_LIGHT_RADIUS)
-            return false;
-
-        long torchPosLong = torchPos.asLong();
-        long spawnPosLong = spawnableSpot.asLong();
-        HashSet<Long> coveredSpots = coverageTrueCache.get(torchPosLong);
-        if(coveredSpots != null && coveredSpots.contains(spawnPosLong))
-            return true;
-
-        HashSet<Long> blockedSpots = coverageFalseCache.get(torchPosLong);
-        if(blockedSpots != null && blockedSpots.contains(spawnPosLong))
-            return false;
-
-        // Prevent counting spots that are only reachable through walls.
-        Vec3 torchCenter = new Vec3(torchPos.getX() + 0.5, torchPos.getY() + 0.6,
-            torchPos.getZ() + 0.5);
-        Vec3 spawnCenter = new Vec3(spawnableSpot.getX() + 0.5,
-            spawnableSpot.getY() + 1.0, spawnableSpot.getZ() + 0.5);
-        boolean covered = BlockUtils.hasLineOfSight(torchCenter, spawnCenter);
-
-        if(covered)
-            coverageTrueCache.computeIfAbsent(torchPosLong, k -> new HashSet<>())
-                .add(spawnPosLong);
-        else
-            coverageFalseCache.computeIfAbsent(torchPosLong, k -> new HashSet<>())
-                .add(spawnPosLong);
-
-        return covered;
+        // Soul/redstone torches emit less than the normal torch used by the plan.
+        return state.is(Blocks.TORCH) || state.is(Blocks.WALL_TORCH);
     }
 
     private static enum Step
@@ -854,12 +616,13 @@ public final class TorchPlannerHack extends Hack
     private static enum CalcPhase
     {
         IDLE,
-        SEARCH_BEST,
-        APPLY_BEST,
+        SCAN,
+        REACH,
+        COVERAGE,
         ASYNC_RUNNING
     }
 
-    private static record Selection(BlockPos min, BlockPos max, AABB box, int volume)
+    private static record Selection(BlockPos min, BlockPos max, AABB box, long volume)
     {
         private Selection(BlockPos pos1, BlockPos pos2)
         {
@@ -870,23 +633,8 @@ public final class TorchPlannerHack extends Hack
                     Math.max(pos1.getY(), pos2.getY()),
                     Math.max(pos1.getZ(), pos2.getZ())),
                 AABB.encapsulatingFullBlocks(pos1, pos2).deflate(1 / 16.0),
-                (Math.abs(pos1.getX() - pos2.getX()) + 1)
-                    * (Math.abs(pos1.getY() - pos2.getY()) + 1)
-                    * (Math.abs(pos1.getZ() - pos2.getZ()) + 1));
+                LightPlanner.selectionVolume(point(pos1), point(pos2)));
         }
     }
 
-    private static record CandidateCoverage(BlockPos pos, long[] spotLongs)
-    {
-    }
-
-    private static record CandidateScore(CandidateCoverage candidate,
-        int coverage)
-    {
-    }
-
-    private static record SolveResult(ArrayList<BlockPos> positions,
-        int uncoveredCount)
-    {
-    }
 }
