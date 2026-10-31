@@ -9,7 +9,6 @@ import java.util.HashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.lwjgl.glfw.GLFW;
 
 import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.blaze3d.vertex.PoseStack;
@@ -245,7 +244,7 @@ public final class TorchPlannerHack extends Hack
     private void handlePositionSelection()
     {
         if(step.pos != null
-            && InputConstants.isKeyDown(MC.getWindow(), GLFW.GLFW_KEY_ENTER))
+            && InputConstants.isKeyDown(InputConstants.KEY_RETURN))
         {
             step = Step.values()[step.ordinal() + 1];
 
